@@ -25,7 +25,7 @@ export interface AuthResponse {
     role: string;
   };
   accessToken: string;
-  refreshToken: string;
+  refreshToken?: string; // optional — backend may send via HttpOnly cookie
 }
 
 export interface AuthUser {
@@ -50,7 +50,7 @@ export class QueryBuilder<T = Record<string, unknown>> {
     this.tableName = cleanPath(table);
   }
 
-  private async request(path: string, init: RequestInit = {}): Promise<unknown> {
+  private async request(path: string, init: RequestInit = {}, retry = true): Promise<unknown> {
     const url = `${this.client.config.baseUrl}/api/data/${path}`;
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
@@ -63,14 +63,47 @@ export class QueryBuilder<T = Record<string, unknown>> {
       headers['Authorization'] = `Bearer ${token}`;
     }
 
-    const res = await fetch(url, {
-      ...init,
-      headers,
-    });
+    let requestInit: RequestInit = { ...init, headers };
+    
+    // Apply request interceptors
+    try {
+      requestInit = await this.client.interceptors.applyRequest(url, requestInit);
+    } catch (err) {
+      await this.client.interceptors.applyError(url, requestInit, err as Error);
+      throw err;
+    }
+
+    let res: Response;
+    try {
+      res = await fetch(url, requestInit);
+    } catch (err) {
+      await this.client.interceptors.applyError(url, requestInit, err as Error);
+      throw err;
+    }
+
+    // Apply response interceptors
+    try {
+      res = await this.client.interceptors.applyResponse(url, requestInit, res);
+    } catch (err) {
+      await this.client.interceptors.applyError(url, requestInit, err as Error);
+      throw err;
+    }
+
+    // Automatic token refresh on 401
+    if (res.status === 401 && retry && this.client.getRefreshToken()) {
+      try {
+        await this.client.refreshAccessToken();
+        return this.request(path, init, false); // retry once
+      } catch {
+        // refresh failed — fall through to error handling
+      }
+    }
 
     if (!res.ok) {
       const err = await res.json().catch(() => ({ error: res.statusText }));
-      throw new Error(err.detail || err.error || `WeezNode error: ${res.status}`);
+      const error = new Error(err.detail || err.error || `WeezNode error: ${res.status}`);
+      await this.client.interceptors.applyError(url, requestInit, error);
+      throw error;
     }
     return res.json();
   }
@@ -122,54 +155,82 @@ export class QueryBuilder<T = Record<string, unknown>> {
     return this.request(`${this.tableName}/${cleanPath(id)}`) as Promise<T | null>;
   }
 
-  // Index Management
-  createIndex(path: string, type: 'btree' | 'gin' = 'btree'): Promise<{ message: string; indexName: string }> {
-    const url = `${this.client.config.baseUrl}/api/tables/${this.tableName}/indexes`;
-    return fetch(url, {
+  // Aggregation
+  aggregate(options: {
+    operation: 'count' | 'sum' | 'avg' | 'min' | 'max';
+    field?: string;
+    groupBy?: string;
+    filter?: Record<string, string>;
+  }): Promise<{ value?: number; results?: Array<{ group: string; value: number }>; count?: number }> {
+    return this.request(`${this.tableName}/_aggregate`, {
       method: 'POST',
+      body: JSON.stringify(options),
+    }) as Promise<{ value?: number; results?: Array<{ group: string; value: number }>; count?: number }>;
+  }
+
+  // Index Management
+  private async indexRequest(url: string, init: RequestInit = {}): Promise<unknown> {
+    let requestInit: RequestInit = {
+      ...init,
       headers: {
         'Content-Type': 'application/json',
         'X-API-Key': this.client.config.apiKey,
+        ...(init.headers as Record<string, string> || {}),
       },
+    };
+
+    const token = this.client.getAccessToken();
+    if (token) {
+      (requestInit.headers as Record<string, string>)['Authorization'] = `Bearer ${token}`;
+    }
+
+    try {
+      requestInit = await this.client.interceptors.applyRequest(url, requestInit);
+    } catch (err) {
+      await this.client.interceptors.applyError(url, requestInit, err as Error);
+      throw err;
+    }
+
+    let res: Response;
+    try {
+      res = await fetch(url, requestInit);
+    } catch (err) {
+      await this.client.interceptors.applyError(url, requestInit, err as Error);
+      throw err;
+    }
+
+    try {
+      res = await this.client.interceptors.applyResponse(url, requestInit, res);
+    } catch (err) {
+      await this.client.interceptors.applyError(url, requestInit, err as Error);
+      throw err;
+    }
+
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: res.statusText }));
+      const error = new Error(err.detail || err.error || `Index error: ${res.status}`);
+      await this.client.interceptors.applyError(url, requestInit, error);
+      throw error;
+    }
+    return res.json();
+  }
+
+  createIndex(path: string, type: 'btree' | 'gin' = 'btree'): Promise<{ message: string; indexName: string }> {
+    const url = `${this.client.config.baseUrl}/api/tables/${this.tableName}/indexes`;
+    return this.indexRequest(url, {
+      method: 'POST',
       body: JSON.stringify({ path, type }),
-    }).then(async res => {
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({ error: res.statusText }));
-        throw new Error(err.detail || err.error || `Index creation error: ${res.status}`);
-      }
-      return res.json();
-    });
+    }) as Promise<{ message: string; indexName: string }>;
   }
 
   listIndexes(): Promise<Array<{ indexname: string; indexdef: string }>> {
     const url = `${this.client.config.baseUrl}/api/tables/${this.tableName}/indexes`;
-    return fetch(url, {
-      headers: {
-        'X-API-Key': this.client.config.apiKey,
-      },
-    }).then(async res => {
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({ error: res.statusText }));
-        throw new Error(err.detail || err.error || `Index listing error: ${res.status}`);
-      }
-      return res.json();
-    });
+    return this.indexRequest(url) as Promise<Array<{ indexname: string; indexdef: string }>>;
   }
 
   deleteIndex(indexName: string): Promise<{ message: string }> {
     const url = `${this.client.config.baseUrl}/api/tables/${this.tableName}/indexes/${cleanPath(indexName)}`;
-    return fetch(url, {
-      method: 'DELETE',
-      headers: {
-        'X-API-Key': this.client.config.apiKey,
-      },
-    }).then(async res => {
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({ error: res.statusText }));
-        throw new Error(err.detail || err.error || `Index deletion error: ${res.status}`);
-      }
-      return res.json();
-    });
+    return this.indexRequest(url, { method: 'DELETE' }) as Promise<{ message: string }>;
   }
 }
 
@@ -186,17 +247,44 @@ export class AuthClient {
 
   private async request(path: string, init: RequestInit = {}): Promise<unknown> {
     const url = `${this.client.config.baseUrl}/api/auth/${path}`;
-    const res = await fetch(url, {
+    let requestInit: RequestInit = {
       ...init,
       headers: {
         'Content-Type': 'application/json',
         'X-API-Key': this.client.config.apiKey,
         ...(init.headers as Record<string, string> || {}),
       },
-    });
+    };
+
+    // Apply request interceptors
+    try {
+      requestInit = await this.client.interceptors.applyRequest(url, requestInit);
+    } catch (err) {
+      await this.client.interceptors.applyError(url, requestInit, err as Error);
+      throw err;
+    }
+
+    let res: Response;
+    try {
+      res = await fetch(url, requestInit);
+    } catch (err) {
+      await this.client.interceptors.applyError(url, requestInit, err as Error);
+      throw err;
+    }
+
+    // Apply response interceptors
+    try {
+      res = await this.client.interceptors.applyResponse(url, requestInit, res);
+    } catch (err) {
+      await this.client.interceptors.applyError(url, requestInit, err as Error);
+      throw err;
+    }
+
     if (!res.ok) {
       const err = await res.json().catch(() => ({ error: res.statusText }));
-      throw new Error(err.detail || err.error || `WeezNode auth error: ${res.status}`);
+      const error = new Error(err.detail || err.error || `WeezNode auth error: ${res.status}`);
+      await this.client.interceptors.applyError(url, requestInit, error);
+      throw error;
     }
     return res.json();
   }
@@ -222,11 +310,11 @@ export class AuthClient {
   }
 
   /** Refresh the access token */
-  async refreshToken(refreshToken: string): Promise<{ accessToken: string; refreshToken: string }> {
+  async refreshToken(refreshToken: string): Promise<{ accessToken: string; refreshToken?: string }> {
     const res = await this.request('token/refresh', {
       method: 'POST',
       body: JSON.stringify({ refreshToken }),
-    }) as { accessToken: string; refreshToken: string };
+    }) as { accessToken: string; refreshToken?: string };
     this.client.setSession(res.accessToken, res.refreshToken);
     return res;
   }
@@ -261,37 +349,135 @@ export class RulesClient {
     this.client = client;
   }
 
+  private async request(url: string, init: RequestInit = {}): Promise<unknown> {
+    let requestInit: RequestInit = {
+      ...init,
+      headers: {
+        'Content-Type': 'application/json',
+        'X-API-Key': this.client.config.apiKey,
+        ...(init.headers as Record<string, string> || {}),
+      },
+    };
+
+    try {
+      requestInit = await this.client.interceptors.applyRequest(url, requestInit);
+    } catch (err) {
+      await this.client.interceptors.applyError(url, requestInit, err as Error);
+      throw err;
+    }
+
+    let res: Response;
+    try {
+      res = await fetch(url, requestInit);
+    } catch (err) {
+      await this.client.interceptors.applyError(url, requestInit, err as Error);
+      throw err;
+    }
+
+    try {
+      res = await this.client.interceptors.applyResponse(url, requestInit, res);
+    } catch (err) {
+      await this.client.interceptors.applyError(url, requestInit, err as Error);
+      throw err;
+    }
+
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: res.statusText }));
+      const error = new Error(err.detail || err.error || `Rules error: ${res.status}`);
+      await this.client.interceptors.applyError(url, requestInit, error);
+      throw error;
+    }
+    return res.json();
+  }
+
   get(): Promise<{ rules: Record<string, any> }> {
     const url = `${this.client.config.baseUrl}/api/rules`;
-    return fetch(url, {
+    return this.request(url, {
       headers: {
         'X-API-Key': this.client.config.apiKey,
       },
-    }).then(async res => {
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({ error: res.statusText }));
-        throw new Error(err.detail || err.error || `Rules error: ${res.status}`);
-      }
-      return res.json();
-    });
+    }) as Promise<{ rules: Record<string, any> }>;
   }
 
   update(rules: Record<string, any>): Promise<{ message: string; rules: Record<string, any> }> {
     const url = `${this.client.config.baseUrl}/api/rules`;
-    return fetch(url, {
+    return this.request(url, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-API-Key': this.client.config.apiKey,
-      },
       body: JSON.stringify({ rules }),
-    }).then(async res => {
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({ error: res.statusText }));
-        throw new Error(err.detail || err.error || `Rules error: ${res.status}`);
-      }
-      return res.json();
-    });
+    }) as Promise<{ message: string; rules: Record<string, any> }>;
+  }
+}
+
+// ────────────────────────────────────────────────
+// Interceptor System
+// ────────────────────────────────────────────────
+
+export type RequestInterceptor = (
+  url: string,
+  init: RequestInit
+) => RequestInit | Promise<RequestInit>;
+
+export type ResponseInterceptor = (
+  url: string,
+  init: RequestInit,
+  response: Response
+) => Response | Promise<Response>;
+
+export type ErrorInterceptor = (
+  url: string,
+  init: RequestInit,
+  error: Error
+) => void | Promise<void>;
+
+class InterceptorManager {
+  private requestInterceptors: RequestInterceptor[] = [];
+  private responseInterceptors: ResponseInterceptor[] = [];
+  private errorInterceptors: ErrorInterceptor[] = [];
+
+  addRequest(interceptor: RequestInterceptor): () => void {
+    this.requestInterceptors.push(interceptor);
+    return () => {
+      const idx = this.requestInterceptors.indexOf(interceptor);
+      if (idx !== -1) this.requestInterceptors.splice(idx, 1);
+    };
+  }
+
+  addResponse(interceptor: ResponseInterceptor): () => void {
+    this.responseInterceptors.push(interceptor);
+    return () => {
+      const idx = this.responseInterceptors.indexOf(interceptor);
+      if (idx !== -1) this.responseInterceptors.splice(idx, 1);
+    };
+  }
+
+  addError(interceptor: ErrorInterceptor): () => void {
+    this.errorInterceptors.push(interceptor);
+    return () => {
+      const idx = this.errorInterceptors.indexOf(interceptor);
+      if (idx !== -1) this.errorInterceptors.splice(idx, 1);
+    };
+  }
+
+  async applyRequest(url: string, init: RequestInit): Promise<RequestInit> {
+    let result = init;
+    for (const interceptor of this.requestInterceptors) {
+      result = await interceptor(url, result);
+    }
+    return result;
+  }
+
+  async applyResponse(url: string, init: RequestInit, response: Response): Promise<Response> {
+    let result = response;
+    for (const interceptor of this.responseInterceptors) {
+      result = await interceptor(url, init, result);
+    }
+    return result;
+  }
+
+  async applyError(url: string, init: RequestInit, error: Error): Promise<void> {
+    for (const interceptor of this.errorInterceptors) {
+      await interceptor(url, init, error);
+    }
   }
 }
 
@@ -299,12 +485,16 @@ export class RulesClient {
 // Main Client
 // ────────────────────────────────────────────────
 
+const STORAGE_KEY = 'weeznode_rt';
+
 export class WeezNodeClient {
   public config: WeezNodeConfig;
   public auth: AuthClient;
   public rules: RulesClient;
+  public interceptors: InterceptorManager;
   private accessToken: string | null = null;
   private refreshTokenVal: string | null = null;
+  private refreshing: Promise<string> | null = null;
 
   constructor(configOrApiKey: WeezNodeConfig | string) {
     if (typeof configOrApiKey === 'string') {
@@ -320,12 +510,22 @@ export class WeezNodeClient {
     }
     this.auth = new AuthClient(this);
     this.rules = new RulesClient(this);
+    this.interceptors = new InterceptorManager();
+    // Restore refresh token from localStorage if available
+    try {
+      this.refreshTokenVal = localStorage.getItem(STORAGE_KEY);
+    } catch { /* noop — localStorage may be unavailable */ }
   }
 
   /** Set current active session tokens */
-  setSession(accessToken: string, refreshToken: string) {
+  setSession(accessToken: string, refreshToken?: string) {
     this.accessToken = accessToken;
-    this.refreshTokenVal = refreshToken;
+    if (refreshToken) {
+      this.refreshTokenVal = refreshToken;
+      try {
+        localStorage.setItem(STORAGE_KEY, refreshToken);
+      } catch { /* noop */ }
+    }
   }
 
   /** Get active user access token */
@@ -342,6 +542,29 @@ export class WeezNodeClient {
   signOut() {
     this.accessToken = null;
     this.refreshTokenVal = null;
+    try {
+      localStorage.removeItem(STORAGE_KEY);
+    } catch { /* noop */ }
+  }
+
+  /** Internal: refresh access token automatically on 401 */
+  async refreshAccessToken(): Promise<string> {
+    if (this.refreshing) return this.refreshing;
+
+    this.refreshing = this.auth.refreshToken(this.refreshTokenVal || '')
+      .then(res => {
+        this.accessToken = res.accessToken;
+        if (res.refreshToken) {
+          this.refreshTokenVal = res.refreshToken;
+          try { localStorage.setItem(STORAGE_KEY, res.refreshToken); } catch { /* noop */ }
+        }
+        return res.accessToken;
+      })
+      .finally(() => {
+        this.refreshing = null;
+      });
+
+    return this.refreshing;
   }
 
   /** Start a query on a collection */
