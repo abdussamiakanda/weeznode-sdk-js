@@ -22,7 +22,7 @@ export class QueryBuilder {
         if (token) {
             headers['Authorization'] = `Bearer ${token}`;
         }
-        let requestInit = { ...init, headers };
+        let requestInit = { credentials: 'include', ...init, headers };
         // Apply request interceptors
         try {
             requestInit = await this.client.interceptors.applyRequest(url, requestInit);
@@ -123,6 +123,7 @@ export class QueryBuilder {
     // Index Management
     async indexRequest(url, init = {}) {
         let requestInit = {
+            credentials: 'include',
             ...init,
             headers: {
                 'Content-Type': 'application/json',
@@ -191,6 +192,7 @@ export class AuthClient {
     async request(path, init = {}) {
         const url = `${this.client.config.baseUrl}/api/auth/${path}`;
         let requestInit = {
+            credentials: 'include',
             ...init,
             headers: {
                 'Content-Type': 'application/json',
@@ -283,6 +285,7 @@ export class RulesClient {
     }
     async request(url, init = {}) {
         let requestInit = {
+            credentials: 'include',
             ...init,
             headers: {
                 'Content-Type': 'application/json',
